@@ -665,7 +665,7 @@ static int vc_core_find_memory_area(VcCore *core, uint32_t address, MemoryArea *
 		}
 	}
 
-	vc_core_set_error(core, VC_CORE_ERROR_NOT_FOUND, "No memory area found for address %x", address);
+	vc_core_set_error(core, VC_CORE_ERROR_NOT_FOUND, "Memory area not found");
 	return -1;
 }
 
@@ -686,7 +686,7 @@ int vc_core_get_module(VcCore *core, uint32_t module_index, VcModule *out_module
 		return -1;
 	}
 
-	if (module_index >= core->thread_count) {
+	if (module_index >= core->module_count) {
 		vc_core_set_error(core, VC_CORE_ERROR_NOT_FOUND, "No module with index %d", module_index);
 		return -1;
 	}

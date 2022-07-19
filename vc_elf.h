@@ -42,11 +42,12 @@ int vc_elf_unwind_one_frame(VcElf *elf, VcUnwindCallbacks *callbacks, VcFrameSta
 int vc_elf_get_error_code(VcElf *elf);
 const char *vc_elf_get_error_message(VcElf *elf);
 
-#define VC_ELF_ERROR_ALREADY_LOADED    1
-#define VC_ELF_ERROR_NOT_LOADED        2
-#define VC_ELF_ERROR_OPEN_FAILED       3
-#define VC_ELF_ERROR_INVALID_ELF       4
-#define VC_ELF_ERROR_NOT_FOUND         5
-#define VC_ELF_ERROR_NOT_IMPLEMENTED   6
+#define VC_ELF_ERROR_ALREADY_LOADED     1
+#define VC_ELF_ERROR_NOT_LOADED         2
+#define VC_ELF_ERROR_OPEN_FAILED        3
+#define VC_ELF_ERROR_INVALID_ELF        4
+#define VC_ELF_ERROR_NOT_FOUND          5
+#define VC_ELF_ERROR_NOT_IMPLEMENTED    6
+#define VC_ELF_ERROR_MEMORY_READ_FAILED 7
 
 #endif // VC_ELF_H

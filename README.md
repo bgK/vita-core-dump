@@ -61,6 +61,7 @@ Error conditions:
 | Unable to unwind: No binary for module 'my_game' | The binary for the module `my_game` was not found. You can load more binaries by using the `--add-elf` argument. At the moment it is not possible to load Sony's `.prx` modules. |
 | Failed to unwind: No CFI information at PC 0xnnnnnnnn | The code for this frame was compiled without Call Frame Information. Recompile the game / library with debug information (`-g`). |
 | Unable to unwind: No module for PC 0xnnnnnnnn | Execution reached an address that is not described in the core dump's modules table. You can use `--add-elf` with the load address set to declare executable memory areas not known to the Vita OS. |
+| Failed to unwind: Failed to read memory at 0xnnnnnnnn | The memory area containing the stack for this thread is not available in the core dump. Computing the backtrace is not possible. |
 
 ### The `modules` command
 ```sh

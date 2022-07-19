@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define VC_VERSION "1.0"
+#define VC_VERSION "1.1"
 
 enum {
 	COMMAND_BACKTRACE,

@@ -577,8 +577,7 @@ static int vc_elf_runtime_cfi_pop_register(VcElf *elf, uint8_t register_index, V
 
 	uint32_t register_value;
 	if (callbacks->memory_read(callbacks->user_data, *vsp, &register_value) < 0) {
-		uint32_t pc_value = frame_state->registers[ARM_REG_PC];
-		vc_elf_set_error(elf, VC_ELF_ERROR_NOT_FOUND, "Failed to read memory at %x when unwinding with PC %x", *vsp, pc_value);
+		vc_elf_set_error(elf, VC_ELF_ERROR_MEMORY_READ_FAILED, "Failed to read memory at 0x%08x", *vsp);
 		return -1;
 	}
 
@@ -893,7 +892,7 @@ static int vc_elf_dwarf_unwind_one_register(VcElf *elf, VcUnwindCallbacks *callb
 
 	if (result_is_location) {
 		if (callbacks->memory_read(callbacks->user_data, expression_result, out_caller_value) < 0) {
-			vc_elf_set_error(elf, VC_ELF_ERROR_NOT_FOUND, "Failed to read memory at %x when unwinding with PC %x", expression_result, frame_pc);
+			vc_elf_set_error(elf, VC_ELF_ERROR_MEMORY_READ_FAILED, "Failed to read memory at 0x%08x", expression_result);
 			return -1;
 		}
 
