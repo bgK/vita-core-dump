@@ -1,10 +1,11 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
+
 #include "vc_elf.h"
 
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
-/* SPDX-License-Identifier: LGPL-3.0-or-later */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,8 +14,6 @@
 
 #include <dwarf.h>
 #include <elfutils/libdw.h>
-
-#define ERROR_MESSAGE_SIZE 2048
 
 #define FREE(x) \
 	free(x);    \
@@ -46,13 +45,19 @@ typedef struct VcElf {
 	uint32_t memory_size;
 
 	int error_code;
-	char error_message[ERROR_MESSAGE_SIZE];
+	char error_message[VC_ELF_ERROR_MESSAGE_SIZE];
 } VcElf;
 
 typedef struct DwarfExpressionState {
-	uint32_t stack[DWARF_EXPRESSION_MAX_STACK];
+	uint64_t stack[DWARF_EXPRESSION_MAX_STACK];
 	uint32_t stack_position;
 } DwarfExpressionState;
+
+typedef struct DwarfTypeInfo {
+	int tag;
+	Dwarf_Word size;
+	Dwarf_Word encoding;
+} DwarfTypeInfo;
 
 typedef struct ExIdxEntry {
 	uint32_t address_offset;
@@ -65,13 +70,19 @@ typedef struct ExTabScript {
 	int remaining_bytes;
 } ExTabScript;
 
+typedef enum DwarfExpressionResultType {
+	DwarfExpressionResultTypeAddress,
+	DwarfExpressionResultTypeValue,
+	DwarfExpressionResultTypeRegister
+} DwarfExpressionResultType;
+
 static void vc_elf_set_error(VcElf *elf, int code, const char *message, ...) __attribute__ ((format (printf, 3, 4)));
 static int vc_elf_close(VcElf *elf);
 
-static int vc_dwarf_expression_evaluate(VcElf *elf, Dwarf_Op *ops, uint32_t ops_count, Dwarf_Frame *dwarf_frame, VcFrameState *frame_state,
-                                   uint32_t *out_result, bool *out_is_location);
-static int vc_dwarf_expression_push(DwarfExpressionState *expression_state, uint32_t value);
-static int vc_dwarf_expression_pop(DwarfExpressionState *expression_state, uint32_t *out_value);
+static int vc_dwarf_expression_evaluate(VcElf *elf, Dwarf_Op *ops, uint32_t ops_count, Dwarf_Frame *dwarf_frame, Dwarf_Attribute *location_attribute, VcFrameState *frame_state_at_entry, VcFrameState *frame_state, Dwarf_Die *function_die,
+                                   uint64_t *out_result, DwarfExpressionResultType *out_result_type);
+static int vc_dwarf_expression_push(DwarfExpressionState *expression_state, uint64_t value);
+static int vc_dwarf_expression_pop(DwarfExpressionState *expression_state, uint64_t *out_value);
 
 VcElf *vc_elf_new() {
 	VcElf *elf = calloc(1, sizeof(VcElf));
@@ -324,7 +335,7 @@ static void vc_elf_set_error(VcElf *elf, int code, const char *message, ...) {
 
 	elf->error_code = code;
 
-	vsnprintf(elf->error_message, ERROR_MESSAGE_SIZE, message, args);
+	vsnprintf(elf->error_message, VC_ELF_ERROR_MESSAGE_SIZE, message, args);
 
 	va_end(args);
 }
@@ -376,6 +387,10 @@ int vc_elf_get_memory_size(VcElf *elf, uint32_t *out_size) {
 	return 0;
 }
 
+static bool vc_elf_dwarf_tag_is_function(int tag) {
+	return tag == DW_TAG_subprogram || tag == DW_TAG_inlined_subroutine || tag == DW_TAG_entry_point;
+}
+
 static int vc_elf_get_pc_info_dwarf(VcElf *elf, uint32_t address, VcAddressInfo *out_pc_info) {
 	assert(elf->dwarf);
 
@@ -424,7 +439,8 @@ static int vc_elf_get_pc_info_dwarf(VcElf *elf, uint32_t address, VcAddressInfo 
 		Dwarf_Die *function_die = NULL;
 
 		for (int i = 0; i < scopes_count; i++) {
-			if (dwarf_tag(&scopes[i]) == DW_TAG_subprogram) {
+			int tag = dwarf_tag(&scopes[i]);
+			if (vc_elf_dwarf_tag_is_function(tag)) {
 				function_die = &scopes[i];
 				break;
 			}
@@ -582,6 +598,7 @@ static int vc_elf_runtime_cfi_pop_register(VcElf *elf, uint8_t register_index, V
 	}
 
 	frame_state->registers[register_index] = register_value;
+	frame_state->registers_with_unknown_value &= ~(1 << register_index);
 	*vsp += 4;
 
 	return 0;
@@ -855,6 +872,9 @@ static int vc_elf_runtime_cfi_unwind_one_frame(VcElf *elf, VcUnwindCallbacks *ca
 
 	memcpy(out_caller_frame_state->registers, &frame_state->registers, sizeof(out_caller_frame_state->registers));
 
+	// Assume r0-r3 are clobbered as they are not callee-saved
+	out_caller_frame_state->registers_with_unknown_value = 0x000F;
+
 	if (vc_elf_runtime_cfi_execute_script(elf, callbacks, &script, out_caller_frame_state) < 0) {
 		return -1;
 	}
@@ -880,28 +900,37 @@ static int vc_elf_dwarf_unwind_one_register(VcElf *elf, VcUnwindCallbacks *callb
 
 	if (!ops_count && !ops) {
 		// The value is unchanged
+		if (frame_state->registers_with_unknown_value & (1 << register_index)) {
+			vc_elf_set_error(elf, VC_ELF_ERROR_NOT_FOUND, "Unable to unwind register %d at PC %x, it is clobbered", register_index, frame_pc);
+			return -1;
+		}
+
 		*out_caller_value = frame_state->registers[register_index];
 		return 0;
 	}
 
-	uint32_t expression_result;
-	bool result_is_location;
-	if (vc_dwarf_expression_evaluate(elf, ops, ops_count, dwarf_frame, frame_state, &expression_result, &result_is_location) < 0) {
+	uint64_t expression_result;
+	DwarfExpressionResultType result_type;
+	if (vc_dwarf_expression_evaluate(elf, ops, ops_count, dwarf_frame, NULL, NULL, frame_state, NULL, &expression_result, &result_type) < 0) {
 		return -1;
 	}
 
-	if (result_is_location) {
+	if (result_type == DwarfExpressionResultTypeValue) {
+		*out_caller_value = expression_result;
+		return 0;
+	}
+
+	if (result_type == DwarfExpressionResultTypeAddress) {
 		if (callbacks->memory_read(callbacks->user_data, expression_result, out_caller_value) < 0) {
-			vc_elf_set_error(elf, VC_ELF_ERROR_MEMORY_READ_FAILED, "Failed to read memory at 0x%08x", expression_result);
+			vc_elf_set_error(elf, VC_ELF_ERROR_MEMORY_READ_FAILED, "Failed to read memory at 0x%08lx", expression_result);
 			return -1;
 		}
 
 		return 0;
 	}
 
-	*out_caller_value = expression_result;
-
-	return 0;
+	vc_elf_set_error(elf, VC_ELF_ERROR_NOT_IMPLEMENTED, "Unhandled dward expression result type: %d", result_type);
+	return -1;
 }
 
 static int vc_elf_dwarf_unwind_one_frame(VcElf *elf, VcUnwindCallbacks *callbacks, VcFrameState *frame_state, VcFrameState *out_caller_frame_state) {
@@ -922,6 +951,8 @@ static int vc_elf_dwarf_unwind_one_frame(VcElf *elf, VcUnwindCallbacks *callback
 	}
 	assert(ra_reg_idx == ARM_REG_LR);
 
+	out_caller_frame_state->registers_with_unknown_value = 0xFFFF;
+
 	for (int register_index = 0; register_index < ARM_REG_PC; register_index++) {
 		uint32_t caller_value;
 		if (vc_elf_dwarf_unwind_one_register(elf, callbacks, dwarf_frame, frame_state, register_index, &caller_value) < 0) {
@@ -929,13 +960,16 @@ static int vc_elf_dwarf_unwind_one_frame(VcElf *elf, VcUnwindCallbacks *callback
 				// LR and SP are required to keep unwinding
 				goto error;
 			}
+
 			continue;
 		}
 
 		if (register_index == ra_reg_idx) {
 			out_caller_frame_state->registers[ARM_REG_PC] = caller_value - 4;
+			out_caller_frame_state->registers_with_unknown_value &= ~(1 << ARM_REG_PC);
 		} else {
 			out_caller_frame_state->registers[register_index] = caller_value;
+			out_caller_frame_state->registers_with_unknown_value &= ~(1 << register_index);
 		}
 	}
 
@@ -977,7 +1011,7 @@ int vc_elf_unwind_one_frame(VcElf *elf, VcUnwindCallbacks *callbacks, VcFrameSta
 	return -1;
 }
 
-static int vc_dwarf_expression_push(DwarfExpressionState *expression_state, uint32_t value) {
+static int vc_dwarf_expression_push(DwarfExpressionState *expression_state, uint64_t value) {
 	if (expression_state->stack_position >= DWARF_EXPRESSION_MAX_STACK) {
 		return -1;
 	}
@@ -988,7 +1022,7 @@ static int vc_dwarf_expression_push(DwarfExpressionState *expression_state, uint
 	return 0;
 }
 
-static int vc_dwarf_expression_pop(DwarfExpressionState *expression_state, uint32_t *out_value) {
+static int vc_dwarf_expression_pop(DwarfExpressionState *expression_state, uint64_t *out_value) {
 	if (expression_state->stack_position == 0) {
 		return -1;
 	}
@@ -999,17 +1033,31 @@ static int vc_dwarf_expression_pop(DwarfExpressionState *expression_state, uint3
 	return 0;
 }
 
-static int vc_dwarf_expression_evaluate(VcElf *elf, Dwarf_Op *ops, uint32_t ops_count, Dwarf_Frame *dwarf_frame, VcFrameState *frame_state,
-                                   uint32_t *out_result, bool *out_is_location) {
+static int vc_dwarf_expression_evaluate(VcElf *elf, Dwarf_Op *ops, uint32_t ops_count, Dwarf_Frame *dwarf_frame, Dwarf_Attribute *location_attribute, VcFrameState *frame_state_at_entry, VcFrameState *frame_state, Dwarf_Die *function_die,
+                                        uint64_t *out_result, DwarfExpressionResultType *out_result_type) {
 	DwarfExpressionState expression_state = { 0 };
 	Dwarf_Op *op = NULL;
+
+	*out_result_type = DwarfExpressionResultTypeAddress;
 
 	for (size_t op_index = 0; op_index < ops_count; op_index++) {
 		op = &ops[op_index];
 
 		switch (op->atom) {
+		case DW_OP_const1u:
+		case DW_OP_const1s:
+		case DW_OP_const2u:
+		case DW_OP_const2s:
+		case DW_OP_const4u:
+		case DW_OP_const4s:
+		case DW_OP_const8u:
+		case DW_OP_const8s:
+		case DW_OP_constu:
+		case DW_OP_consts:
+			if (vc_dwarf_expression_push(&expression_state, op->number) < 0) goto bad_push;
+			break;
 		case DW_OP_plus_uconst: {
-			uint32_t value;
+			uint64_t value;
 			if (vc_dwarf_expression_pop(&expression_state, &value) < 0) goto bad_pop;
 
 			value += op->number;
@@ -1017,16 +1065,180 @@ static int vc_dwarf_expression_evaluate(VcElf *elf, Dwarf_Op *ops, uint32_t ops_
 			if (vc_dwarf_expression_push(&expression_state, value) < 0) goto bad_push;
 			break;
 		}
+		case DW_OP_lit0:
+		case DW_OP_lit1:
+		case DW_OP_lit2:
+		case DW_OP_lit3:
+		case DW_OP_lit4:
+		case DW_OP_lit5:
+		case DW_OP_lit6:
+		case DW_OP_lit7:
+		case DW_OP_lit8:
+		case DW_OP_lit9:
+		case DW_OP_lit10:
+		case DW_OP_lit11:
+		case DW_OP_lit12:
+		case DW_OP_lit13:
+		case DW_OP_lit14:
+		case DW_OP_lit15:
+		case DW_OP_lit16:
+		case DW_OP_lit17:
+		case DW_OP_lit18:
+		case DW_OP_lit19:
+		case DW_OP_lit20:
+		case DW_OP_lit21:
+		case DW_OP_lit22:
+		case DW_OP_lit23:
+		case DW_OP_lit24:
+		case DW_OP_lit25:
+		case DW_OP_lit26:
+		case DW_OP_lit27:
+		case DW_OP_lit28:
+		case DW_OP_lit29:
+		case DW_OP_lit30:
+		case DW_OP_lit31: {
+			int value = op->atom - DW_OP_lit0;
+
+			if (vc_dwarf_expression_push(&expression_state, value) < 0) goto bad_push;
+			break;
+		}
+		case DW_OP_reg0:
+		case DW_OP_reg1:
+		case DW_OP_reg2:
+		case DW_OP_reg3:
+		case DW_OP_reg4:
+		case DW_OP_reg5:
+		case DW_OP_reg6:
+		case DW_OP_reg7:
+		case DW_OP_reg8:
+		case DW_OP_reg9:
+		case DW_OP_reg10:
+		case DW_OP_reg11:
+		case DW_OP_reg12:
+		case DW_OP_reg13:
+		case DW_OP_reg14:
+		case DW_OP_reg15:
+		case DW_OP_reg16:
+		case DW_OP_reg17:
+		case DW_OP_reg18:
+		case DW_OP_reg19:
+		case DW_OP_reg20:
+		case DW_OP_reg21:
+		case DW_OP_reg22:
+		case DW_OP_reg23:
+		case DW_OP_reg24:
+		case DW_OP_reg25:
+		case DW_OP_reg26:
+		case DW_OP_reg27:
+		case DW_OP_reg28:
+		case DW_OP_reg29:
+		case DW_OP_reg30:
+		case DW_OP_reg31: {
+			assert(ops_count == 1);
+
+			int reg = op->atom - DW_OP_reg0;
+
+			if (reg >= ARM_REG_COUNT) goto bad_register;
+
+			if (vc_dwarf_expression_push(&expression_state, reg) < 0) goto bad_push;
+			*out_result_type = DwarfExpressionResultTypeRegister;
+
+			break;
+		}
 		case DW_OP_regx: {
+			assert(ops_count == 1);
+
 			if (op->number >= ARM_REG_COUNT) goto bad_register;
 
-			uint32_t value = frame_state->registers[op->number];
+			if (vc_dwarf_expression_push(&expression_state, op->number) < 0) goto bad_push;
+			*out_result_type = DwarfExpressionResultTypeRegister;
+
+			break;
+		}
+		case DW_OP_fbreg: {
+			if (!function_die) {
+				vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Dwarf Op requested FB reg but function is available");
+				return -1;
+			}
+
+			Dwarf_Attribute frame_base_mem;
+			Dwarf_Attribute *frame_base_attribute = dwarf_attr_integrate(function_die, DW_AT_frame_base, &frame_base_mem);
+			if (!frame_base_attribute) {
+				vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to get the frame base attribute for function '%s': %s", dwarf_diename(function_die), dwarf_errmsg(-1));
+				return -1;
+			}
+
+			Dwarf_Op *frame_base_ops;
+			size_t frame_base_ops_count;
+			if (dwarf_getlocation(frame_base_attribute, &frame_base_ops, &frame_base_ops_count) < 0) {
+				vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Failed to get frame base ops: %s", dwarf_errmsg(-1));
+				return -1;
+			}
+
+			uint64_t frame_base;
+			DwarfExpressionResultType frame_base_type;
+			if (vc_dwarf_expression_evaluate(elf, frame_base_ops, frame_base_ops_count, dwarf_frame, frame_base_attribute, frame_state_at_entry, frame_state, NULL, &frame_base, &frame_base_type) < 0) {
+				return -1;
+			}
+
+			assert(frame_base_type == DwarfExpressionResultTypeAddress);
+
+			uint32_t value = frame_base + op->number;
+
+			if (vc_dwarf_expression_push(&expression_state, value) < 0) goto bad_push;
+			break;
+		}
+		case DW_OP_breg0:
+		case DW_OP_breg1:
+		case DW_OP_breg2:
+		case DW_OP_breg3:
+		case DW_OP_breg4:
+		case DW_OP_breg5:
+		case DW_OP_breg6:
+		case DW_OP_breg7:
+		case DW_OP_breg8:
+		case DW_OP_breg9:
+		case DW_OP_breg10:
+		case DW_OP_breg11:
+		case DW_OP_breg12:
+		case DW_OP_breg13:
+		case DW_OP_breg14:
+		case DW_OP_breg15:
+		case DW_OP_breg16:
+		case DW_OP_breg17:
+		case DW_OP_breg18:
+		case DW_OP_breg19:
+		case DW_OP_breg20:
+		case DW_OP_breg21:
+		case DW_OP_breg22:
+		case DW_OP_breg23:
+		case DW_OP_breg24:
+		case DW_OP_breg25:
+		case DW_OP_breg26:
+		case DW_OP_breg27:
+		case DW_OP_breg28:
+		case DW_OP_breg29:
+		case DW_OP_breg30:
+		case DW_OP_breg31: {
+			int reg = op->atom - DW_OP_breg0;
+
+			if (reg >= ARM_REG_COUNT) goto bad_register;
+
+			if (frame_state->registers_with_unknown_value & (1 << reg)) {
+				goto clobbered_register;
+			}
+
+			uint32_t value = frame_state->registers[reg] + op->number;
 
 			if (vc_dwarf_expression_push(&expression_state, value) < 0) goto bad_push;
 			break;
 		}
 		case DW_OP_bregx: {
 			if (op->number >= ARM_REG_COUNT) goto bad_register;
+
+			if (frame_state->registers_with_unknown_value & (1 << op->number)) {
+				goto clobbered_register;
+			}
 
 			uint32_t value = frame_state->registers[op->number] + op->number2;
 
@@ -1046,34 +1258,107 @@ static int vc_dwarf_expression_evaluate(VcElf *elf, Dwarf_Op *ops, uint32_t ops_
 				return -1;
 			}
 
-			uint32_t cfa;
-			bool cfa_is_location;
-			if (vc_dwarf_expression_evaluate(elf, cfa_ops, cfa_ops_count, NULL, frame_state, &cfa, &cfa_is_location) < 0) {
+			uint64_t cfa;
+			DwarfExpressionResultType cfa_type;
+			if (vc_dwarf_expression_evaluate(elf, cfa_ops, cfa_ops_count, NULL, NULL, frame_state_at_entry, frame_state, function_die, &cfa, &cfa_type) < 0) {
 				return -1;
 			}
-			assert(cfa_is_location);
+			assert(cfa_type == DwarfExpressionResultTypeAddress);
 
 			if (vc_dwarf_expression_push(&expression_state, cfa) < 0) goto bad_push;
 			break;
 		}
+		case DW_OP_implicit_value:
+			if (!location_attribute) {
+				vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Dwarf Op requested entry value expression but no location attribute is available");
+				return -1;
+			}
+
+			Dwarf_Block implicit_value;
+			if (dwarf_getlocation_implicit_value(location_attribute, op, &implicit_value) < 0) {
+				vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "No implicit value found: %s", dwarf_errmsg(-1));
+				return -1;
+			}
+
+			if (implicit_value.length > 8) {
+				vc_elf_set_error(elf, VC_ELF_ERROR_NOT_IMPLEMENTED, "Unhandled large implicit value");
+				return -1;
+			}
+
+			uint64_t value = 0;
+			memcpy(&value, implicit_value.data, implicit_value.length);
+			*out_result_type = DwarfExpressionResultTypeValue;
+
+			if (vc_dwarf_expression_push(&expression_state, value) < 0) goto bad_push;
+			break;
 		case DW_OP_stack_value: {
 			if (vc_dwarf_expression_pop(&expression_state, out_result) < 0) goto bad_pop;
-			*out_is_location = false;
+			*out_result_type = DwarfExpressionResultTypeValue;
 			return 0;
 		}
+		case DW_OP_GNU_entry_value: {
+			if (!frame_state_at_entry) {
+				vc_elf_set_error(elf, VC_ELF_ERROR_NOT_FOUND, "Optimized out - Function entry state not available");
+				return -1;
+			}
+
+			if (!location_attribute) {
+				vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Dwarf Op requested entry value expression but no location attribute is available");
+				return -1;
+			}
+
+			Dwarf_Attribute entry_value_attribute;
+			if (dwarf_getlocation_attr(location_attribute, op, &entry_value_attribute) < 0) {
+				vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "No entry value expression attribute found: %s", dwarf_errmsg(-1));
+				return -1;
+			}
+
+			Dwarf_Op *entry_value_ops;
+			size_t entry_value_ops_count;
+			if (dwarf_getlocation(&entry_value_attribute, &entry_value_ops, &entry_value_ops_count) < 0) {
+				vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Failed to get entry value ops: %s", dwarf_errmsg(-1));
+				return -1;
+			}
+
+			uint64_t entry_value;
+			DwarfExpressionResultType entry_value_type;
+			if (vc_dwarf_expression_evaluate(elf, entry_value_ops, entry_value_ops_count, dwarf_frame, NULL, NULL, frame_state_at_entry, function_die, &entry_value, &entry_value_type) < 0) {
+				return -1;
+			}
+
+			uint32_t value;
+			if (entry_value_type == DwarfExpressionResultTypeRegister) {
+				if (entry_value >= ARM_REG_COUNT) goto bad_register;
+
+				if (frame_state_at_entry->registers_with_unknown_value & (1 << entry_value)) {
+					goto clobbered_register;
+				}
+
+				value = frame_state_at_entry->registers[entry_value];
+			} else {
+				value = entry_value;
+			}
+
+			if (vc_dwarf_expression_push(&expression_state, value) < 0) goto bad_push;
+
+			break;
+		}
 		default:
-			vc_elf_set_error(elf, VC_ELF_ERROR_NOT_IMPLEMENTED, "Dwarf Op not implemented %x", op->atom);
+			vc_elf_set_error(elf, VC_ELF_ERROR_NOT_IMPLEMENTED, "Dwarf Op not implemented 0x%x", op->atom);
 			return -1;
 		}
 	}
 
 	if (vc_dwarf_expression_pop(&expression_state, out_result) < 0) goto bad_pop;
-	*out_is_location = true;
 
 	return 0;
 
+clobbered_register:
+	vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Optimized out - Register is clobbered");
+	return -1;
+
 bad_register:
-	vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Invalid ARM register %ld", op->number);
+	vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Invalid ARM register");
 	return -1;
 
 bad_push:
@@ -1083,4 +1368,366 @@ bad_push:
 bad_pop:
 	vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Dwarf expression tried to pop an empty stack");
 	return -1;
+}
+
+static void vc_elf_variable_set_error(VcVariableInfo *variable, const char *message, ...) {
+	va_list args;
+	va_start(args, message);
+
+	variable->location_type = VcVariableLocationTypeError;
+	vsnprintf(variable->error_message, VC_ELF_ERROR_MESSAGE_SIZE, message, args);
+
+	va_end(args);
+}
+
+static int vc_elf_get_type_info(VcElf *elf, Dwarf_Die *die, const char *context_name, DwarfTypeInfo *out_info) {
+	Dwarf_Attribute type_attribute_mem;
+	Dwarf_Attribute *type_attribute = dwarf_attr_integrate(die, DW_AT_type, &type_attribute_mem);
+	if (!type_attribute) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to get the type attribute for local variable '%s'", context_name);
+		return -1;
+	}
+
+	Dwarf_Die local_variable_type_die_mem;
+	Dwarf_Die *local_variable_type_die = dwarf_formref_die(type_attribute, &local_variable_type_die_mem);
+	if (!local_variable_type_die) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to dereference the type attribute for local variable '%s'", context_name);
+		return -1;
+	}
+
+	Dwarf_Die base_type_die;
+	if (dwarf_peel_type(local_variable_type_die, &base_type_die) < 0) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to peel the local variable type");
+		return -1;
+	}
+
+	Dwarf_Word type_encoding = 0;
+	Dwarf_Word type_size = 0;
+	int type_tag = dwarf_tag(&base_type_die);
+
+	switch (type_tag) {
+	case DW_TAG_array_type: {
+		Dwarf_Die array_child;
+		if (dwarf_child(&base_type_die, &array_child) < 0) {
+			vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Array variable '%s' has no Dwarf child DIE", context_name);
+			return -1;
+		}
+
+		// TODO: Make sure there are no other children
+
+		int array_child_tag = dwarf_tag(&array_child);
+		if (array_child_tag != DW_TAG_subrange_type) {
+			vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Array variable '%s' Dwarf child DIE has type %x", context_name, array_child_tag);
+			return -1;
+		}
+
+		Dwarf_Word lower_bound = 0;
+
+		Dwarf_Attribute lower_bound_attribute_mem;
+		Dwarf_Attribute *lower_bound_attribute = dwarf_attr_integrate(&array_child, DW_AT_lower_bound, &lower_bound_attribute_mem);
+		if (lower_bound_attribute) {
+			dwarf_formudata(lower_bound_attribute, &lower_bound);
+		}
+
+		Dwarf_Attribute upper_bound_attribute_mem;
+		Dwarf_Attribute *upper_bound_attribute = dwarf_attr_integrate(&array_child, DW_AT_upper_bound, &upper_bound_attribute_mem);
+		if (!upper_bound_attribute) {
+			vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to get the upper bound attribute for local variable '%s'", context_name);
+			return -1;
+		}
+
+		Dwarf_Word upper_bound;
+		if (dwarf_formudata(upper_bound_attribute, &upper_bound) < 0) {
+			vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to get the upper bound form for local variable '%s'", context_name);
+			return -1;
+		}
+
+		if (upper_bound < lower_bound) {
+			vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "The array upper bound %ld is less than the lower bound %ld for local variable '%s'", upper_bound, lower_bound, context_name);
+			return -1;
+		}
+
+		Dwarf_Word element_count = upper_bound - lower_bound + 1;
+
+		Dwarf_Word element_size = 0;
+
+		Dwarf_Attribute element_size_attribute_mem;
+		Dwarf_Attribute *element_size_attribute = dwarf_attr_integrate(&array_child, DW_AT_byte_size, &element_size_attribute_mem);
+		if (element_size_attribute) {
+			dwarf_formudata(element_size_attribute, &element_size);
+		} else {
+			DwarfTypeInfo element_info;
+			if (vc_elf_get_type_info(elf, &base_type_die, context_name, &element_info) < 0) {
+				return -1;
+			}
+
+			element_size = element_info.size;
+		}
+
+		type_size = element_count * element_size;
+		break;
+	}
+	case DW_TAG_enumeration_type: {
+		Dwarf_Attribute size_attribute_mem;
+		Dwarf_Attribute *size_attribute = dwarf_attr_integrate(&base_type_die, DW_AT_byte_size, &size_attribute_mem);
+		if (size_attribute) {
+			dwarf_formudata(size_attribute, &type_size);
+		} else {
+			DwarfTypeInfo underlying_type_info;
+			if (vc_elf_get_type_info(elf, &base_type_die, context_name, &underlying_type_info) < 0) {
+				return -1;
+			}
+
+			type_size = underlying_type_info.size;
+		}
+
+		break;
+	}
+	case DW_TAG_pointer_type:
+	case DW_TAG_reference_type:
+		type_size = 4;
+		break;
+	case DW_TAG_base_type: {
+		Dwarf_Attribute encoding_attribute_mem;
+		Dwarf_Attribute *encoding_attribute = dwarf_attr_integrate(&base_type_die, DW_AT_encoding, &encoding_attribute_mem);
+		if (!encoding_attribute) {
+			vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to get the type encoding attribute for local variable '%s'", context_name);
+			return -1;
+		}
+
+		if (dwarf_formudata(encoding_attribute, &type_encoding) < 0) {
+			vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to get the type encoding form for local variable '%s'", context_name);
+			return -1;
+		}
+
+		Dwarf_Attribute size_attribute_mem;
+		Dwarf_Attribute *size_attribute = dwarf_attr_integrate(&base_type_die, DW_AT_byte_size, &size_attribute_mem);
+		if (!size_attribute) {
+			vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to get the type size attribute for local variable '%s'", context_name);
+			return -1;
+		}
+
+		if (dwarf_formudata(size_attribute, &type_size) < 0) {
+			vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to get the type size form for local variable '%s'", context_name);
+			return -1;
+		}
+
+		break;
+	}
+	case DW_TAG_structure_type:
+	case DW_TAG_class_type:
+	case DW_TAG_union_type: {
+		Dwarf_Attribute size_attribute_mem;
+		Dwarf_Attribute *size_attribute = dwarf_attr_integrate(&base_type_die, DW_AT_byte_size, &size_attribute_mem);
+		if (!size_attribute) {
+			vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to get the type size attribute for local variable '%s'", context_name);
+			return -1;
+		}
+
+		if (dwarf_formudata(size_attribute, &type_size) < 0) {
+			vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to get the type size form for local variable '%s'", context_name);
+			return -1;
+		}
+		break;
+	}
+	default:
+		vc_elf_set_error(elf, VC_ELF_ERROR_NOT_IMPLEMENTED, "Unhandled DIE type %x for local variable '%s'", type_tag, context_name);
+		return -1;
+	}
+
+	out_info->tag      = type_tag;
+	out_info->size     = type_size;
+	out_info->encoding = type_encoding;
+
+	return 0;
+}
+
+static int vc_elf_handle_local_variable(VcElf *elf, uint32_t address, VcFrameState *frame_state_at_entry, VcFrameState *frame_state, Dwarf_Frame *dwarf_frame, Dwarf_Die *local_variable_die, Dwarf_Die *function_die, VcVariableInfo *out_variable_info) {
+	int die_tag = dwarf_tag(local_variable_die);
+	if (die_tag != DW_TAG_variable && die_tag != DW_TAG_formal_parameter) {
+		return -1;
+	}
+
+	const char *local_variable_name = dwarf_diename(local_variable_die);
+	if (!local_variable_name) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to get local variable name");
+		return -1;
+	}
+
+	out_variable_info->name = local_variable_name;
+
+	DwarfTypeInfo type_info;
+	if (vc_elf_get_type_info(elf, local_variable_die, local_variable_name, &type_info) < 0) {
+		return -1;
+	}
+
+	out_variable_info->size = type_info.size;
+
+	switch (type_info.tag) {
+	case DW_TAG_enumeration_type:
+	case DW_TAG_pointer_type:
+	case DW_TAG_reference_type:
+		out_variable_info->type = VcVariableTypeInteger;
+		break;
+	case DW_TAG_base_type:
+		switch (type_info.encoding) {
+		case DW_ATE_signed:
+		case DW_ATE_signed_char:
+		case DW_ATE_unsigned:
+		case DW_ATE_unsigned_char:
+		case DW_ATE_boolean:
+		case DW_ATE_address:
+			out_variable_info->type = VcVariableTypeInteger;
+			break;
+		case DW_ATE_float:
+			out_variable_info->type = VcVariableTypeFloat;
+			break;
+		default:
+			out_variable_info->type = VcVariableTypeUnhandled;
+			break;
+		}
+		break;
+	default:
+		out_variable_info->type = VcVariableTypeUnhandled;
+		break;
+	}
+
+	Dwarf_Attribute location_attribute_mem;
+	Dwarf_Attribute *location_attribute = dwarf_attr_integrate(local_variable_die, DW_AT_location, &location_attribute_mem);
+	if (!location_attribute) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to get the location attribute for local variable '%s'", local_variable_name);
+		return -1;
+	}
+
+	Dwarf_Op *exprs[1];
+	size_t exprlens[1];
+	int expressions_count = dwarf_getlocation_addr(location_attribute, address, exprs, exprlens, 1);
+	if (expressions_count < 0) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Unable to get the location expression for local variable '%s'", local_variable_name);
+		return -1;
+	}
+
+	if (expressions_count == 0) {
+		vc_elf_variable_set_error(out_variable_info, "Optimized out - Not available at this PC");
+		return 0;
+	}
+
+	uint64_t result;
+	DwarfExpressionResultType result_type;
+	if (vc_dwarf_expression_evaluate(elf, exprs[0], exprlens[0], dwarf_frame, location_attribute, frame_state_at_entry, frame_state, function_die, &result, &result_type) < 0) {
+		vc_elf_variable_set_error(out_variable_info, "%s", vc_elf_get_error_message(elf));
+		return 0;
+	}
+
+	switch (result_type) {
+	case DwarfExpressionResultTypeAddress:
+		out_variable_info->location_type = VcVariableLocationTypeMemory;
+		out_variable_info->location = result;
+		break;
+	case DwarfExpressionResultTypeValue:
+		out_variable_info->location_type = VcVariableLocationTypeValue;
+		out_variable_info->location = result;
+		break;
+	case DwarfExpressionResultTypeRegister:
+		if (frame_state->registers_with_unknown_value & (1 << result)) {
+			vc_elf_variable_set_error(out_variable_info, "Optimized out - Register r%d is clobbered", result);
+		} else {
+			out_variable_info->location_type = VcVariableLocationTypeValue;
+			out_variable_info->location = frame_state->registers[result];
+		}
+		break;
+	}
+
+	return 0;
+}
+
+static void vc_elf_add_variable_to_array(VcVariableInfo *variable, VcVariableInfo **variables, uint32_t *variable_count) {
+	if (!*variable_count) {
+		*variables = malloc(sizeof(VcVariableInfo));
+	} else {
+		*variables = realloc(*variables, sizeof(VcVariableInfo) * ((*variable_count) + 1));
+	}
+
+	memcpy(*variables + *variable_count, variable, sizeof(VcVariableInfo));
+	*variable_count += 1;
+}
+
+int vc_elf_get_local_variables_at_pc(VcElf *elf, uint32_t address, VcFrameState *frame_state_at_entry, VcFrameState *frame_state, VcVariableInfo **out_variable_infos, uint32_t *out_variable_count) {
+	if (!elf->loaded) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_NOT_LOADED, "No elf loaded");
+		return -1;
+	}
+
+	if (!elf->dwarf) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_NOT_FOUND, "No dwarf information");
+		return -1;
+	}
+
+	Dwarf_Die cu_die_mem;
+	Dwarf_Die *cu_die = dwarf_addrdie(elf->dwarf, address, &cu_die_mem);
+	if (!cu_die) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_NOT_FOUND, "No dwarf compilation unit DIE found for PC at %x", address);
+		return -1;
+	}
+
+	Dwarf_Die *scopes;
+	int scopes_count = dwarf_getscopes(cu_die, address, &scopes);
+	if (scopes_count < 0) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Failed to retrieve the scopes for PC %x: %s", address, dwarf_errmsg(-1));
+		return -1;
+	}
+
+	if (scopes_count == 0) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_NOT_FOUND, "No scopes found");
+		return -1;
+	}
+
+	Dwarf_Die *function_die = NULL;
+	for (int i = 0; i < scopes_count; i++) {
+		int tag = dwarf_tag(&scopes[i]);
+		if (vc_elf_dwarf_tag_is_function(tag)) {
+			function_die = &scopes[i];
+			break;
+		}
+	}
+
+	Dwarf_Frame *dwarf_frame = NULL;
+	if (dwarf_cfi_addrframe(elf->dwarf_cfi, address, &dwarf_frame) < 0) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_NOT_FOUND, "No CFI information at PC %x: %s", address, dwarf_errmsg(-1));
+		return -1;
+	}
+
+	*out_variable_count = 0;
+	*out_variable_infos = 0;
+
+	bool reached_function = false;
+	for (int i = 0; i < scopes_count && !reached_function; i++) {
+		Dwarf_Die *scope = &scopes[i];
+
+		int scope_tag = dwarf_tag(scope);
+		if (vc_elf_dwarf_tag_is_function(scope_tag)) {
+			reached_function = true;
+		}
+
+		Dwarf_Die scope_child;
+		if (dwarf_child(scope, &scope_child) < 0) {
+			continue;
+		}
+
+		VcVariableInfo variable_info;
+		if (vc_elf_handle_local_variable(elf, address, frame_state_at_entry, frame_state, dwarf_frame, &scope_child, function_die, &variable_info) >= 0) {
+			vc_elf_add_variable_to_array(&variable_info, out_variable_infos, out_variable_count);
+		}
+
+		while (dwarf_siblingof(&scope_child, &scope_child) == 0) {
+			if (vc_elf_handle_local_variable(elf, address, frame_state_at_entry, frame_state, dwarf_frame, &scope_child, function_die, &variable_info) >= 0) {
+				vc_elf_add_variable_to_array(&variable_info, out_variable_infos, out_variable_count);
+			}
+		}
+	}
+
+	FREE(dwarf_frame);
+	FREE(scopes);
+
+	return 0;
 }

@@ -107,11 +107,31 @@ typedef struct CoreThread {
 	uint32_t unk_196;
 } CoreThread;
 
+typedef struct CoreNeonRegister {
+	uint32_t word[4];
+} CoreNeonRegister;
+
 typedef struct CoreThreadRegisters {
 	uint32_t structure_size;
 	uint32_t thread_id;
 	uint32_t gpr[16];
-	// TODO: More registers
+
+	uint32_t unk_80;
+	uint32_t unk_84;
+	uint32_t unk_88;
+
+	CoreNeonRegister neon[16];
+
+	uint32_t unk_336;
+	uint32_t unk_340;
+	uint32_t unk_344;
+	uint32_t unk_348;
+	uint32_t unk_352;
+
+	uint32_t ifsr;
+	uint32_t ifar;
+	uint32_t dfsr;
+	uint32_t dfar;
 } CoreThreadRegisters;
 
 typedef struct MemoryArea {
@@ -248,7 +268,7 @@ static int vc_core_uncompress(VcCore *core) {
 	snprintf(uncompressed_core_dump_file_name, 1024, "uncompressed-core-dump-XXXXXX");
 	int uncompressed_core_dump_fd = mkstemp(uncompressed_core_dump_file_name);
 	if (uncompressed_core_dump_fd < 0) {
-		vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "Failed to create uncompressed core dump temporary file %s: %s", uncompressed_core_dump_file_name, strerror(errno));
+		vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "Failed to create uncompressed core dump temporary file %s: %s", uncompressed_core_dump_file_name, strerror(errno));
 		goto error;
 	}
 
@@ -256,7 +276,7 @@ static int vc_core_uncompress(VcCore *core) {
 
 	uncompressed_core_dump = fdopen(uncompressed_core_dump_fd, "wb");
 	if (!uncompressed_core_dump) {
-		vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "Failed to open uncompressed core dump temporary file %s: %s", core->uncompressed_filename, strerror(errno));
+		vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "Failed to open uncompressed core dump temporary file %s: %s", core->uncompressed_filename, strerror(errno));
 		goto error;
 	}
 
@@ -271,14 +291,14 @@ static int vc_core_uncompress(VcCore *core) {
 				break; // End of input
 			}
 
-			vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "Failed to read as a gzip stream: %s", error_message);
+			vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "Failed to read as a gzip stream: %s", error_message);
 			goto error;
 		}
 
 		fwrite(buffer, read, 1, uncompressed_core_dump);
 
 		if (ferror(uncompressed_core_dump)) {
-			vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "Failed to write to the uncompressed core dump temporary file %s: %s", core->uncompressed_filename, strerror(errno));
+			vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "Failed to write to the uncompressed core dump temporary file %s: %s", core->uncompressed_filename, strerror(errno));
 			goto error;
 		}
 	}
@@ -299,7 +319,7 @@ static int vc_core_uncompress(VcCore *core) {
 			error_message = "Unknown error";
 		}
 
-		vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "%s", error_message);
+		vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "%s", error_message);
 		goto error;
 	}
 
@@ -344,30 +364,30 @@ static int vc_core_read_elf(VcCore *core) {
 
 	core->elf = elf_begin(core->elf_fd, ELF_C_READ, NULL);
 	if (!core->elf) {
-		vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "Failed to open as an elf file: %s", elf_errmsg(-1));
+		vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "Failed to open as an elf file: %s", elf_errmsg(-1));
 		goto error;
 	}
 
 	GElf_Ehdr ehdr_mem;
 	GElf_Ehdr *ehdr = gelf_getehdr(core->elf, &ehdr_mem);
 	if (!ehdr) {
-		vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "Failed to get the elf file header: %s", elf_errmsg(-1));
+		vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "Failed to get the elf file header: %s", elf_errmsg(-1));
 		goto error;
 	}
 
 	if (ehdr->e_type != ET_CORE) {
-		vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "The file is not a core dump");
+		vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "The file is not a core dump");
 		goto error;
 	}
 
 	if (ehdr->e_ident[EI_CLASS] != ELFCLASS32 || ehdr->e_ident[EI_DATA] != ELFDATA2LSB || ehdr->e_machine != EM_ARM) {
-		vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "The elf is not for the 32-bit LE ARM architecture");
+		vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "The elf is not for the 32-bit LE ARM architecture");
 		goto error;
 	}
 
 	size_t phdr_count;
 	if (elf_getphdrnum(core->elf, &phdr_count) == -1) {
-		vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "Failed to get the program header count: %s", elf_errmsg(-1));
+		vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "Failed to get the program header count: %s", elf_errmsg(-1));
 		goto error;
 	}
 
@@ -377,7 +397,7 @@ static int vc_core_read_elf(VcCore *core) {
 		GElf_Phdr mem;
 		GElf_Phdr *phdr = gelf_getphdr(core->elf, phdridx, &mem);
 		if (!phdr) {
-			vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "Failed to get program header %lu: %s", phdridx, elf_errmsg(-1));
+			vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "Failed to get program header %lu: %s", phdridx, elf_errmsg(-1));
 			goto error;
 		}
 
@@ -404,7 +424,7 @@ static int vc_core_read_elf(VcCore *core) {
 			GElf_Phdr mem;
 			GElf_Phdr *phdr = gelf_getphdr(core->elf, phdridx, &mem);
 			if (!phdr) {
-				vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "Failed to get program header %lu: %s", phdridx, elf_errmsg(-1));
+				vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "Failed to get program header %lu: %s", phdridx, elf_errmsg(-1));
 				goto error;
 			}
 
@@ -451,7 +471,7 @@ static int vc_core_read_elf_note(VcCore *core, GElf_Phdr *phdr) {
 
 	Elf_Data *note_data = elf_getdata_rawchunk(core->elf, phdr->p_offset, phdr->p_filesz, (phdr->p_align == 8 ? ELF_T_NHDR8 : ELF_T_NHDR));
 	if (!note_data) {
-		vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "Unable to get note data pointer: %s", elf_errmsg(-1));
+		vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "Unable to get note data pointer: %s", elf_errmsg(-1));
 		return -1;
 	}
 
@@ -459,7 +479,7 @@ static int vc_core_read_elf_note(VcCore *core, GElf_Phdr *phdr) {
 	size_t name_offset;
 	size_t desc_offset;
 	if (gelf_getnote(note_data, 0, &nhdr, &name_offset, &desc_offset) <= 0) {
-		vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "Unable to read note header: %s", elf_errmsg(-1));
+		vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "Unable to read note header: %s", elf_errmsg(-1));
 		return -1;
 	}
 
@@ -561,7 +581,7 @@ invalid:
 	FREE(core->modules);
 	core->module_count = 0;
 
-	vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "Invalid MODULE_INFO");
+	vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "Invalid MODULE_INFO");
 	return -1;
 }
 
@@ -601,7 +621,7 @@ invalid:
 	FREE(core->threads);
 	core->thread_count = 0;
 
-	vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "Invalid THREAD_INFO");
+	vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "Invalid THREAD_INFO");
 	return -1;
 }
 
@@ -630,7 +650,7 @@ static int vc_core_read_thread_reg_info(VcCore *core, uint8_t *data, size_t data
 
 		CoreThreadRegisters *thread = &core->thread_registers[thread_index];
 		*thread = READ(data, CoreThreadRegisters);
-		assert(thread->structure_size == 376);
+		assert(thread->structure_size == sizeof(CoreThreadRegisters));
 
 		data = thread_start + thread->structure_size;
 	}
@@ -641,7 +661,7 @@ invalid:
 	FREE(core->thread_registers);
 	core->thread_registers_count = 0;
 
-	vc_core_set_error(core, VC_CORE_ERROR_CORE_INVALID_DUMP, "Invalid THREAD_REG_INFO");
+	vc_core_set_error(core, VC_CORE_ERROR_INVALID_CORE_DUMP, "Invalid THREAD_REG_INFO");
 	return -1;
 }
 
@@ -747,6 +767,11 @@ int vc_core_get_thread(VcCore *core, uint32_t index, VcThread *out_thread) {
 	out_thread->stop_reason = thread->stop_reason;
 	memcpy(out_thread->registers, registers->gpr, sizeof(registers->gpr));
 
+	out_thread->ifsr = registers->ifsr;
+	out_thread->ifar = registers->ifar;
+	out_thread->dfsr = registers->dfsr;
+	out_thread->dfar = registers->dfar;
+
 	return 0;
 }
 
@@ -761,7 +786,7 @@ int vc_core_get_thread_count(VcCore *core, uint32_t *out_count) {
 	return 0;
 }
 
-int vc_core_memory_read(VcCore *core, uint32_t address, uint32_t *out_result) {
+int vc_core_memory_read(VcCore *core, uint32_t address, uint32_t length, uint8_t **out_buffer, uint32_t *out_bytes_read) {
 	if (!core->loaded) {
 		vc_core_set_error(core, VC_CORE_ERROR_NOT_LOADED, "No core dump loaded");
 		return -1;
@@ -780,7 +805,29 @@ int vc_core_memory_read(VcCore *core, uint32_t address, uint32_t *out_result) {
 
 	assert(raw_data->d_size == area->size);
 
-	*out_result = *(uint32_t *)(raw_data->d_buf + address - area->address);
+	uint8_t *source = raw_data->d_buf + address - area->address;
+	uint8_t *end    = raw_data->d_buf + raw_data->d_size;
+	uint32_t available_bytes = end - source;
+
+	*out_buffer = source;
+	*out_bytes_read = available_bytes < length ? available_bytes : length;
+
+	return 0;
+}
+
+int vc_core_memory_read_u32(VcCore *core, uint32_t address, uint32_t *out_result) {
+	uint8_t *out_bytes;
+	uint32_t out_bytes_read;
+	if (vc_core_memory_read(core, address, sizeof(uint32_t), &out_bytes, &out_bytes_read) < 0) {
+		return -1;
+	}
+
+	if (out_bytes_read != sizeof(uint32_t)) {
+		vc_core_set_error(core, VC_CORE_ERROR_NOT_FOUND, "Not enough data available");
+		return -1;
+	}
+
+	*out_result = *(uint32_t *)out_bytes;
 
 	return 0;
 }
@@ -802,10 +849,10 @@ const char *vc_core_get_thread_status_name(uint32_t thread_status) {
 
 const char *vc_core_get_thread_stop_reason_name(uint32_t stop_reason) {
 	switch (stop_reason) {
-	case 0x30002: return "Undefined instruction exception";
-	case 0x30003: return "Prefetch abort exception";
-	case 0x30004: return "Data abort exception";
-	case 0x60080: return "Division by zero";
-	default:  return NULL;
+	case VcStopReasonUndefinedInstructionException: return "Undefined instruction exception";
+	case VcStopReasonPrefetchAbortException:        return "Prefetch abort exception";
+	case VcStopReasonDataAbortException:            return "Data abort exception";
+	case VcStopReasonDivisionByEero:                return "Division by zero";
+	default:                                        return NULL;
 	}
 }

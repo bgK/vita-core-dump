@@ -10,6 +10,7 @@ vita-core-dump <core-dump-path> <command> [<arguments>]
 ```
 The available commands are:
 * `backtrace`: Print a backtrace for one or more threads
+* `memory`: Print raw memory
 * `modules`: Print the list of loaded modules
 * `stack`: Print the stack for one or more threads
 * `threads`: Print the list of threads
@@ -17,7 +18,7 @@ The available commands are:
 ### The `backtrace` command
 ```sh
 vita-core-dump <core-dump-path> backtrace [--add-elf=<elf-path>[:<hex-load-address>]]
-         [--thread=(<thread-index>|all|crashed)] [--show-registers]
+         [--thread=(<thread-index>|all|crashed)] [--show-locals] [--show-registers]
 ```
 Displays a backtrace for one or all of the threads of the process that generated
 the core dump. The default is to display only the thread that caused the crash:
@@ -25,7 +26,7 @@ the core dump. The default is to display only the thread that caused the crash:
 $ vita-core-dump psp2core-1658050394-0x003179256b-eboot.bin.psp2dmp backtrace \
                                             --add-elf so_loader               \
                                             --add-elf libChowdren.so:98000000
-Thread 6: (Running) - Data abort exception at PC 0x8118f47e
+Thread 6: (Running) - Data abort exception at PC 0x8118f47e reading memory at 0x00000008
   0x8114847e      (so_loader): in _free_r+0xc9
   0x81147589      (so_loader): in _fclose_r.part.0+0x5c
   0x001b9f1b (libChowdren.so): in BaseFile::~BaseFile()+0x6
@@ -52,7 +53,8 @@ It can use either Dwarf CFI (`.eh_frame` or `.debug_frame` elf sections) or ARM 
 Dwarf CFI is produced with debug builds (the `-g` compiler flag). ARM runtime CFI is produced by default when building C++ code with exceptions enabled.
 It can otherwise be enabled with `-funwind-tables`.
 
-It is recommended to use debug builds so `vita-core-dump` can display richer information such as function names and line numbers.
+It is recommended to use debug builds without optimizations so `vita-core-dump` can display richer information such as function names, line numbers and local variables:
+`CFLAGS=-Og -g`.
 
 Error conditions:
 | Error message | Explanation   |
@@ -62,6 +64,17 @@ Error conditions:
 | Failed to unwind: No CFI information at PC 0xnnnnnnnn | The code for this frame was compiled without Call Frame Information. Recompile the game / library with debug information (`-g`). |
 | Unable to unwind: No module for PC 0xnnnnnnnn | Execution reached an address that is not described in the core dump's modules table. You can use `--add-elf` with the load address set to declare executable memory areas not known to the Vita OS. |
 | Failed to unwind: Failed to read memory at 0xnnnnnnnn | The memory area containing the stack for this thread is not available in the core dump. Computing the backtrace is not possible. |
+
+### The `memory` command
+```sh
+vita-core-dump <core-dump-path> memory <hex-address> [--length=<bytes-to-print>]
+```
+Displays a hex dump of the crashed process's memory at the specified address. This is useful to investigate the memory at addresses displayed by
+the other commands.
+```
+$ ./vita-core-dump ../test8/psp2core.bin.psp2dmp memory 812c0ed8 --length=6
+812c0ed8: 68 65 6c 6c  6f 00                                                                                       |hello.                          |
+```
 
 ### The `modules` command
 ```sh
@@ -85,14 +98,14 @@ Module 15: so_loader
 ### The `stack` command
 ```sh
 vita-core-dump <core-dump-path> stack [--add-elf=<elf-path>[:<hex-load-address>]]
-         [--thread=(<thread-index>|all|crashed)] [--size=<addresses-to-print>]
+         [--thread=(<thread-index>|all|crashed)] [--length=<addresses-to-print>]
 ```
 Displays the values on the stack of one or more thread near the stack pointer:
 ```
 $ vita-core-dump psp2core-1658050394-0x003179256b-eboot.bin.psp2dmp stack     \
                                             --add-elf so_loader               \
                                             --add-elf libChowdren.so:98000000
-Thread 6: (Running) - Data abort exception at PC 0x8118f47e
+Thread 6: (Running) - Data abort exception at PC 0x8118f47e reading memory at 0x00000008
       0x8f600de4: 0x8119149d  so_loader in __vita_duplicate_descriptor+0x20
       0x8f600de8: 0x815555d8  so_loader+0x8150e5d8
       0x8f600dec: 0x00000000  

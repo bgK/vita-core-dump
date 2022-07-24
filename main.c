@@ -12,11 +12,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define VC_VERSION "1.1"
+#define VC_VERSION "1.2"
 
 enum {
 	COMMAND_BACKTRACE,
 	COMMAND_HELP,
+	COMMAND_MEMORY,
 	COMMAND_MODULES,
 	COMMAND_STACK,
 	COMMAND_THREADS,
@@ -32,7 +33,7 @@ char *__cxa_demangle(const char *mangled_name, char *output_buffer, size_t *leng
 
 static int memory_read_callback(void *user_data, uint32_t address, uint32_t *out_result) {
 	VcCore *core = user_data;
-	return vc_core_memory_read(core, address, out_result);
+	return vc_core_memory_read_u32(core, address, out_result);
 }
 
 static void print_usage() {
@@ -45,6 +46,7 @@ static void print_usage() {
 	printf("   modules      Print the list of loaded modules\n");
 	printf("   stack        Print the stack for one or more threads\n");
 	printf("   threads      Print the list of threads\n");
+	printf("   memory       Display data from the process's memory\n");
 	printf("\n");
 	printf("See vita-core-dump help <command> to read more about a command.\n");
 }
@@ -54,6 +56,8 @@ static int parse_command(const char *command) {
 		return COMMAND_BACKTRACE;
 	} else if (strcasecmp(command, "help") == 0) {
 		return COMMAND_HELP;
+	} else if (strcasecmp(command, "memory") == 0) {
+		return COMMAND_MEMORY;
 	} else if (strcasecmp(command, "modules") == 0) {
 		return COMMAND_MODULES;
 	} else if (strcasecmp(command, "threads") == 0) {
@@ -77,6 +81,7 @@ static void print_thread_summary(uint32_t thread_index, VcThread *thread) {
 	} else {
 		printf(" (%x)", thread->status);
 	}
+
 	if (thread->stop_reason) {
 		const char *stop_reason_name = vc_core_get_thread_stop_reason_name(thread->stop_reason);
 		if (stop_reason_name) {
@@ -85,10 +90,18 @@ static void print_thread_summary(uint32_t thread_index, VcThread *thread) {
 			printf(" - Stop reason 0x%x", thread->stop_reason);
 		}
 	}
-	printf(" at PC 0x%08x\n", thread->registers[ARM_REG_PC]);
+
+	printf(" at PC 0x%08x", thread->registers[ARM_REG_PC]);
+
+	if (thread->stop_reason == VcStopReasonDataAbortException) {
+		bool wnr = (thread->dfsr >> ARM_DFSR_WNR) & 1;
+		printf(" %s memory at 0x%08x", wnr ? "writing" : "reading", thread->dfar);
+	}
+
+	printf("\n");
 }
 
-static void print_registers(uint32_t *registers) {
+static void print_registers(uint32_t *registers, uint16_t registers_with_unknown_value) {
 	printf("   ");
 	for (uint32_t register_index = 0; register_index < ARM_REG_COUNT; register_index++) {
 		if (register_index != 0 && (register_index % 4) == 0) {
@@ -105,16 +118,148 @@ static void print_registers(uint32_t *registers) {
 			snprintf(register_name, 4, "r%d", register_index);
 		}
 
-		printf(" %3s: 0x%08x", register_name, registers[register_index]);
+		if (registers_with_unknown_value & (1 << register_index)) {
+			printf(" %3s: unknown   ", register_name);
+		} else {
+			printf(" %3s: 0x%08x", register_name, registers[register_index]);
+		}
 	}
 	printf("\n");
 }
 
-static int print_backtrace_for_thread(VcCore *core, VcAddressSpace *address_space, VcThread *thread, bool show_registers) {
+static void print_hex_dump(const uint8_t *data, int length, int bytes_per_line, int start_address, int indentation) {
+	assert(1 <= bytes_per_line && bytes_per_line <= 32);
+	int offset = start_address;
+	while (length >= bytes_per_line) {
+		for (int i = 0; i < indentation; i++) {
+			printf(" ");
+		}
+		printf("%08x: ", offset);
+		for (int i = 0; i < bytes_per_line; i++) {
+			printf("%02x ", data[i]);
+			if (i % 4 == 3) {
+				printf(" ");
+			}
+		}
+		printf(" |");
+		for (int i = 0; i < bytes_per_line; i++) {
+			uint8_t c = data[i];
+			if (c < 32 || c >= 127) {
+				c = '.';
+			}
+			printf("%c", c);
+		}
+		printf("|\n");
+		data   += bytes_per_line;
+		length -= bytes_per_line;
+		offset += bytes_per_line;
+	}
+
+	if (length <= 0) {
+		return;
+	}
+
+	for (int i = 0; i < indentation; i++) {
+		printf(" ");
+	}
+	printf("%08x: ", offset);
+	for (int i = 0; i < bytes_per_line; i++) {
+		if (i < length) {
+			printf("%02x ", data[i]);
+		} else {
+			printf("   ");
+		}
+		if (i % 4 == 3) {
+			printf(" ");
+		}
+	}
+	printf(" |");
+	int i = 0;
+	for (; i < length; i++) {
+		uint8_t c = data[i];
+		if (c < 32 || c >= 127) {
+			c = '.';
+		}
+		printf("%c", c);
+	}
+	for (; i < bytes_per_line; i++) {
+		printf(" ");
+	}
+	printf("|\n");
+}
+
+static int print_variable(VcCore *core, VcVariableInfo *variable) {
+	if (variable->size == 0) {
+		assert(false);
+		variable->size = 4;
+	}
+
+	uint8_t *data;
+	uint32_t address = 0;
+	if (variable->location_type == VcVariableLocationTypeMemory) {
+		uint32_t bytes_read;
+		if (vc_core_memory_read(core, variable->location, variable->size, &data, &bytes_read) < 0) {
+			printf("    %15s: Data missing in core dump\n", variable->name);
+			return -1;
+		}
+		address = variable->location;
+	} else if (variable->location_type == VcVariableLocationTypeValue) {
+		data = (uint8_t *)&variable->location;
+	} else if (variable->location_type == VcVariableLocationTypeError) {
+		printf("    %15s: %s\n", variable->name, variable->error_message);
+		return -1;
+	} else {
+		assert(false);
+	}
+
+	switch (variable->type) {
+	case VcVariableTypeInteger:
+		if (variable->size == 1) {
+			printf("    %15s: 0x%02x\n", variable->name, *(uint8_t *)data);
+		} else if (variable->size == 2) {
+			printf("    %15s: 0x%04x\n", variable->name, *(uint16_t *)data);
+		} else if (variable->size == 4) {
+			printf("    %15s: 0x%08x\n", variable->name, *(uint32_t *)data);
+		} else if (variable->size == 8) {
+			printf("    %15s: 0x%016lx\n", variable->name, *(uint64_t *)data);
+		} else {
+			printf("    %15s:\n", variable->name);
+			print_hex_dump(data, variable->size, 16, address, 15);
+		}
+		break;
+	case VcVariableTypeFloat:
+		if (variable->size == 4) {
+			printf("    %15s: %f\n", variable->name, *(float *)data);
+		} else if (variable->size == 8) {
+			printf("    %15s: %f\n", variable->name, *(double *)data);
+		} else {
+			printf("    %15s:\n", variable->name);
+			print_hex_dump(data, variable->size, 16, address, 15);
+		}
+		break;
+	case VcVariableTypeUnhandled:
+		printf("    %15s:\n", variable->name);
+		print_hex_dump(data, variable->size, 16, address, 15);
+		break;
+	}
+
+	return 0;
+}
+
+static int print_backtrace_for_thread(VcCore *core, VcAddressSpace *address_space, VcThread *thread, bool show_locals, bool show_registers) {
 	VcFrameState frame_state;
 	memcpy(frame_state.registers, thread->registers, sizeof(frame_state.registers));
+	frame_state.registers_with_unknown_value = 0;
+
+	uint32_t frame_number = 0;
 
 	while (1) {
+		frame_number++;
+		if (frame_number > 500) {
+			fprintf(stderr, "Too many frames to unwind, aborting\n");
+			goto error;
+		}
+
 		uint32_t pc = frame_state.registers[ARM_REG_PC];
 
 		VcAddressSpaceModule *module;
@@ -122,7 +267,13 @@ static int print_backtrace_for_thread(VcCore *core, VcAddressSpace *address_spac
 			printf("  0x%08x %16s: ??\n", pc, "");
 
 			if (show_registers) {
-				print_registers(frame_state.registers);
+				print_registers(frame_state.registers, frame_state.registers_with_unknown_value);
+			}
+
+			// Maybe we branched with link into a bad address, try unwinding from LR
+			if (frame_number == 1 && thread->stop_reason == VcStopReasonPrefetchAbortException && thread->registers[ARM_REG_PC] == thread->ifar) {
+				frame_state.registers[ARM_REG_PC] = frame_state.registers[ARM_REG_LR];
+				continue;
 			}
 
 			fprintf(stderr, "Unable to unwind: No module for PC 0x%x\n", pc);
@@ -136,7 +287,7 @@ static int print_backtrace_for_thread(VcCore *core, VcAddressSpace *address_spac
 			printf("  0x%08x %16s: ??\n", pc, pretty_module);
 
 			if (show_registers) {
-				print_registers(frame_state.registers);
+				print_registers(frame_state.registers, frame_state.registers_with_unknown_value);
 			}
 
 			fprintf(stderr, "Unable to unwind: No binary for module '%s'\n", module->name);
@@ -172,7 +323,7 @@ static int print_backtrace_for_thread(VcCore *core, VcAddressSpace *address_spac
 		}
 
 		if (show_registers) {
-			print_registers(frame_state.registers);
+			print_registers(frame_state.registers, frame_state.registers_with_unknown_value);
 		}
 
 		VcUnwindCallbacks callbacks = {
@@ -181,8 +332,29 @@ static int print_backtrace_for_thread(VcCore *core, VcAddressSpace *address_spac
 		};
 
 		VcFrameState caller_frame_state;
-		if (vc_elf_unwind_one_frame(module->elf, &callbacks, &frame_state, &caller_frame_state) < 0) {
-			fprintf(stderr, "Failed to unwind: %s\n", vc_elf_get_error_message(module->elf));
+		int unwind_result = vc_elf_unwind_one_frame(module->elf, &callbacks, &frame_state, &caller_frame_state);
+		char unwind_error_message[VC_ELF_ERROR_MESSAGE_SIZE];
+		if (unwind_result < 0) {
+			strncpy(unwind_error_message, vc_elf_get_error_message(module->elf), VC_ELF_ERROR_MESSAGE_SIZE);
+			unwind_error_message[VC_ELF_ERROR_MESSAGE_SIZE - 1] = '\0';
+		}
+
+		if (show_locals) {
+			VcFrameState *caller_frame_state_ptr = unwind_result >= 0 ? &caller_frame_state : NULL;
+
+			VcVariableInfo *local_variables;
+			uint32_t local_variable_count;
+			if (vc_elf_get_local_variables_at_pc(module->elf, elf_va_pc, caller_frame_state_ptr, &frame_state, &local_variables, &local_variable_count) >= 0) {
+				for (uint32_t variable_index = 0; variable_index < local_variable_count; variable_index++) {
+					VcVariableInfo *local_variable = &local_variables[variable_index];
+					print_variable(core, local_variable);
+				}
+				free(local_variables);
+			}
+		}
+
+		if (unwind_result < 0) {
+			fprintf(stderr, "Failed to unwind: %s\n", unwind_error_message);
 			goto error;
 		}
 
@@ -203,7 +375,7 @@ static int print_stack_for_thread(VcCore *core, VcAddressSpace *address_space, V
 
 	for (uint32_t stack_address = start_address; stack_address < end_address; stack_address += sizeof(uint32_t)) {
 		uint32_t stack_value;
-		if (vc_core_memory_read(core, stack_address, &stack_value) < 0) {
+		if (vc_core_memory_read_u32(core, stack_address, &stack_value) < 0) {
 			fprintf(stderr, "Unable to read memory from core dump at address %x: %s\n", stack_address, vc_core_get_error_message(core));
 			return -1;
 		}
@@ -340,6 +512,7 @@ error:
 static int handle_command_backtrace(VcCore *core, int argc, const char **argv) {
 	static struct option long_options[] = {
 		{ "add-elf",        required_argument, 0,  0 },
+		{ "show-locals",    no_argument,       0,  0 },
 		{ "show-registers", no_argument,       0,  0 },
 		{ "thread",         required_argument, 0,  0 },
 		{ 0,                0,                 0,  0 }
@@ -352,6 +525,7 @@ static int handle_command_backtrace(VcCore *core, int argc, const char **argv) {
 	}
 
 	int selected_thread = THREAD_INDEX_CRASHED;
+	bool show_locals    = false;
 	bool show_registers = false;
 
 	optind = 3; // Two arguments were already consumed
@@ -371,10 +545,13 @@ static int handle_command_backtrace(VcCore *core, int argc, const char **argv) {
 					goto error;
 				}
 				break;
-			case 1: // --show-registers
+			case 1: // --show-locals
+				show_locals = true;
+				break;
+			case 2: // --show-registers
 				show_registers = true;
 				break;
-			case 2: // --thread
+			case 3: // --thread
 				if (handle_argument_thread(optarg, &selected_thread) < 0) {
 					goto error;
 				}
@@ -415,7 +592,7 @@ static int handle_command_backtrace(VcCore *core, int argc, const char **argv) {
 		}
 
 		print_thread_summary(thread_index, &thread);
-		print_backtrace_for_thread(core, address_space, &thread, show_registers);
+		print_backtrace_for_thread(core, address_space, &thread, show_locals, show_registers);
 	}
 
 	vc_address_space_free(address_space);
@@ -425,6 +602,73 @@ static int handle_command_backtrace(VcCore *core, int argc, const char **argv) {
 error:
 	vc_address_space_free(address_space);
 
+	return -1;
+}
+
+static int handle_command_memory(VcCore *core, int argc, const char **argv) {
+	static struct option long_options[] = {
+		{ "length",         required_argument, 0,  0 },
+		{ 0,                0,                 0,  0 }
+	};
+
+	int length = 256;
+
+	optind = 3; // Two arguments were already consumed
+
+	while (1) {
+		int long_option_index;
+		int opt = getopt_long(argc, (char *const *)argv, "", long_options, &long_option_index);
+		if (opt == -1) {
+			break; // done parsing
+		} else if (opt == '?') {
+			goto error; // error
+		} else if (opt == 0) {
+			// long option
+			switch (long_option_index) {
+			case 0: { // --length
+				char *end;
+				length = strtol(optarg, &end, 10);
+				if (*optarg == '\0' || *end != '\0' || length < 0) {
+					fprintf(stderr, "Invalid --length argument '%s'\n", optarg);
+					goto error;
+				}
+				break;
+			}
+			}
+		}
+	}
+
+	if (length > 1024 * 1024 * 1024) {
+		fprintf(stderr, "The memory area to display can't be larger than 1 MiB.\n");
+		goto error;
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "The memory command requires an address.\nSee vita-core-dump help memory.\n");
+		goto error;
+	}
+
+	const char *address_as_string = argv[optind];
+
+	char *end;
+	uint32_t address = strtoul(address_as_string, &end, 16);
+	if (*address_as_string == '\0' || *end != '\0') {
+		fprintf(stderr, "Invalid address '%s'\n", address_as_string);
+		goto error;
+	}
+
+	uint8_t *buffer;
+	uint32_t bytes_read;
+	if (vc_core_memory_read(core, address, length, &buffer, &bytes_read) < 0) {
+		fprintf(stderr, "Data not available in core dump: %s\n", vc_core_get_error_message(core));
+		goto error;
+	}
+
+	print_hex_dump(buffer, bytes_read, 32, address, 0);
+
+	return 0;
+
+error:
 	return -1;
 }
 
@@ -597,7 +841,7 @@ static int handle_command_threads(VcCore *core, int argc, const char **argv) {
 		print_thread_summary(thread_index, &thread);
 
 		if (show_registers) {
-			print_registers(thread.registers);
+			print_registers(thread.registers, 0);
 
 			if (thread_index != (thread_count - 1)) {
 				printf("\n");
@@ -618,7 +862,7 @@ static int handle_command_help(int argc, const char **argv) {
 	switch (command) {
 	case COMMAND_BACKTRACE:
 		printf("usage: vita-core-dump <core-dump-path> backtrace [--add-elf=<elf-path>[:<hex-load-address>]]\n");
-		printf("         [--thread=(<thread-index>|all|crashed)] [--show-registers]\n");
+		printf("         [--thread=(<thread-index>|all|crashed)] [--show-locals] [--show-registers]\n");
 		printf("\n");
 		printf("Displays a backtrace for one or all of the threads of the process that generated\n");
 		printf("the core dump. The default is to display only the thread that caused the crash.\n");
@@ -637,6 +881,11 @@ static int handle_command_help(int argc, const char **argv) {
 	case COMMAND_HELP:
 		print_usage();
 		break;
+	case COMMAND_MEMORY:
+		printf("usage: vita-core-dump <core-dump-path> memory <hex-address> [--length=<bytes-to-print>]\n");
+		printf("\n");
+		printf("Displays a hex dump of the crashed process's memory at the specified address.\n");
+		break;
 	case COMMAND_MODULES:
 		printf("usage: vita-core-dump <core-dump-path> modules\n");
 		printf("\n");
@@ -644,7 +893,7 @@ static int handle_command_help(int argc, const char **argv) {
 		break;
 	case COMMAND_STACK:
 		printf("usage: vita-core-dump <core-dump-path> stack [--add-elf=<elf-path>[:<hex-load-address>]]\n");
-		printf("         [--thread=(<thread-index>|all|crashed)] [--size=<addresses-to-print>]\n");
+		printf("         [--thread=(<thread-index>|all|crashed)] [--length=<addresses-to-print>]\n");
 		printf("\n");
 		printf("Displays the values on the stack of one or more thread near the stack pointer.\n");
 		printf("\n");
@@ -693,6 +942,11 @@ int main(int argc, const char **argv) {
 		break;
 	case COMMAND_HELP:
 		if (handle_command_help(argc - 2, argv + 2) < 0) {
+			goto error;
+		}
+		break;
+	case COMMAND_MEMORY:
+		if (handle_command_memory(core, argc, argv) < 0) {
 			goto error;
 		}
 		break;
