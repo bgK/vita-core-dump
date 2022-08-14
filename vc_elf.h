@@ -67,6 +67,7 @@ int vc_elf_load(VcElf *elf, const char *filename);
 void vc_elf_free(VcElf *elf);
 
 int vc_elf_get_base_address(VcElf *elf, uint32_t *out_address);
+int vc_elf_get_module_name(VcElf *elf, const char **out_module_name);
 int vc_elf_get_memory_size(VcElf *elf, uint32_t *out_size);
 int vc_elf_get_pc_info(VcElf *elf, uint32_t address, VcAddressInfo *out_pc_info);
 int vc_elf_get_local_variables_at_pc(VcElf *elf, uint32_t address, VcFrameState *dwarf_frame_at_entry, VcFrameState *frame_state, VcVariableInfo **out_variable_infos, uint32_t *out_variable_count);

@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define VC_VERSION "1.2"
+#define VC_VERSION "1.3"
 
 enum {
 	COMMAND_BACKTRACE,
@@ -438,32 +438,51 @@ static int handle_argument_thread(char *argument, int *out_thread_index) {
 }
 
 static int handle_argument_add_elf(char *argument, VcAddressSpace *address_space) {
-	VcElf *elf = NULL;
+	VcElf *elf = vc_elf_new();
 
 	if (*argument == '\0') {
 		fprintf(stderr, "Invalid --add-elf argument '%s'. Expected '<path-to-elf>[:<hex-load-address>]'\n", argument);
 		goto error;
 	}
 
+	char *file_path;
 	uint32_t load_address;
 	VcAddressSpaceModule *matching_module = NULL;
 
 	char *address_part = strchr(argument, ':');
 	if (!address_part) {
-		// The expected module name is the base name of the elf file without extension
-		char *expected_module_name = strdup(basename(argument));
-		char *extension_dot = strchr(expected_module_name, '.');
-		if (extension_dot && extension_dot != expected_module_name) *extension_dot = '\0';
+		file_path = argument;
 
-		if (vc_address_space_find_module_by_name(address_space, expected_module_name, &matching_module) < 0) {
-			fprintf(stderr, "Could not find a core dump module matching the elf file name '%s'. Ensure the elf file name matches the desired module or specify a load address if this is a dynamically loaded binary.\n", expected_module_name);
-			free(expected_module_name);
+		if (vc_elf_load(elf, file_path) < 0) {
+			fprintf(stderr, "Failed to load elf file '%s': %s\n", file_path, vc_elf_get_error_message(elf));
+			goto error;
+		}
+
+		const char *module_name;
+		if (vc_elf_get_module_name(elf, &module_name) < 0) {
+			fprintf(stderr, "Failed to get elf module name for '%s': %s\n", file_path, vc_elf_get_error_message(elf));
+			goto error;
+		}
+
+		char *allocated_module_name = NULL;
+		if (!module_name) {
+			// Default to the base name of the elf file without extension
+			allocated_module_name = strdup(basename(argument));
+			char *extension_dot = strchr(allocated_module_name, '.');
+			if (extension_dot && extension_dot != allocated_module_name) *extension_dot = '\0';
+
+			module_name = allocated_module_name;
+		}
+
+		if (vc_address_space_find_module_by_name(address_space, module_name, &matching_module) < 0) {
+			fprintf(stderr, "Could not find a core dump module named '%s'. Ensure you are loading a SCE elf, or that the elf file name matches the desired module, or specify a load address if this is a dynamically loaded binary.\n", module_name);
+			free(allocated_module_name);
 			goto error;
 		}
 
 		load_address = matching_module->load_address;
 
-		free(expected_module_name);
+		free(allocated_module_name);
 	} else {
 		if (address_part == argument || address_part[1] == '\0') {
 			fprintf(stderr, "Invalid --add-elf argument '%s'. Expected '<path-to-elf>[:<hex-load-address>]'\n", argument);
@@ -479,14 +498,13 @@ static int handle_argument_add_elf(char *argument, VcAddressSpace *address_space
 			fprintf(stderr, "Invalid --add-elf load address '%s'\n", address_part);
 			goto error;
 		}
-	}
 
-	char *file_path = argument;
+		file_path = argument;
 
-	elf = vc_elf_new();
-	if (vc_elf_load(elf, file_path) < 0) {
-		fprintf(stderr, "Failed to load elf file '%s': %s\n", file_path, vc_elf_get_error_message(elf));
-		goto error;
+		if (vc_elf_load(elf, file_path) < 0) {
+			fprintf(stderr, "Failed to load elf file '%s': %s\n", file_path, vc_elf_get_error_message(elf));
+			goto error;
+		}
 	}
 
 	if (!matching_module) {
@@ -638,7 +656,7 @@ static int handle_command_memory(VcCore *core, int argc, const char **argv) {
 		}
 	}
 
-	if (length > 1024 * 1024 * 1024) {
+	if (length > 1024 * 1024) {
 		fprintf(stderr, "The memory area to display can't be larger than 1 MiB.\n");
 		goto error;
 	}

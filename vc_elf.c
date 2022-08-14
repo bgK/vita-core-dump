@@ -44,6 +44,8 @@ typedef struct VcElf {
 	uint32_t base_address;
 	uint32_t memory_size;
 
+	char *module_name;
+
 	int error_code;
 	char error_message[VC_ELF_ERROR_MESSAGE_SIZE];
 } VcElf;
@@ -76,8 +78,35 @@ typedef enum DwarfExpressionResultType {
 	DwarfExpressionResultTypeRegister
 } DwarfExpressionResultType;
 
+typedef struct SceModuleInfo {
+	uint16_t attributes;
+	uint16_t version;
+	char     name[27];
+	uint8_t  type;
+	uint32_t gp_value;
+	uint32_t export_top;
+	uint32_t export_end;
+	uint32_t import_top;
+	uint32_t import_end;
+	uint32_t module_nid;
+	uint32_t tls_start;
+	uint32_t tls_filesz;
+	uint32_t tls_memsz;
+	uint32_t module_start;
+	uint32_t module_stop;
+	uint32_t exidx_top;
+	uint32_t exidx_end;
+	uint32_t extab_top;
+	uint32_t extab_end;
+} SceModuleInfo;
+
+#define ET_SCE_EXEC         0xfe00
+#define ET_SCE_RELEXEC      0xfe04
+
 static void vc_elf_set_error(VcElf *elf, int code, const char *message, ...) __attribute__ ((format (printf, 3, 4)));
 static int vc_elf_close(VcElf *elf);
+
+static int vc_elf_load_sce_module_info(VcElf *elf);
 
 static int vc_dwarf_expression_evaluate(VcElf *elf, Dwarf_Op *ops, uint32_t ops_count, Dwarf_Frame *dwarf_frame, Dwarf_Attribute *location_attribute, VcFrameState *frame_state_at_entry, VcFrameState *frame_state, Dwarf_Die *function_die,
                                    uint64_t *out_result, DwarfExpressionResultType *out_result_type);
@@ -102,6 +131,7 @@ void vc_elf_free(VcElf *elf) {
 
 	vc_elf_close(elf);
 
+	FREE(elf->module_name);
 	FREE(elf->filename);
 	FREE(elf);
 }
@@ -242,7 +272,7 @@ int vc_elf_load(VcElf *elf, const char *filename) {
 		goto error;
 	}
 
-	if (ehdr->e_type == ET_NONE || ehdr->e_type == ET_CORE) {
+	if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN && ehdr->e_type != ET_SCE_EXEC && ehdr->e_type != ET_SCE_RELEXEC) {
 		vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Invalid elf type: %d", ehdr->e_type);
 		goto error;
 	}
@@ -306,6 +336,12 @@ int vc_elf_load(VcElf *elf, const char *filename) {
 		elf->dwarf_cfi = dwarf_getcfi(elf->dwarf);
 		if (!elf->dwarf_cfi) {
 			elf->dwarf_cfi = dwarf_getcfi_elf(elf->elf);
+		}
+	}
+
+	if (ehdr->e_type == ET_SCE_EXEC || ehdr->e_type == ET_SCE_RELEXEC) {
+		if (vc_elf_load_sce_module_info(elf) < 0) {
+			goto error;
 		}
 	}
 
@@ -375,6 +411,16 @@ int vc_elf_get_base_address(VcElf *elf, uint32_t *out_address) {
 	return 0;
 }
 
+int vc_elf_get_module_name(VcElf *elf, const char **out_module_name) {
+	if (!elf->loaded) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_NOT_LOADED, "No elf loaded");
+		return -1;
+	}
+
+	*out_module_name = elf->module_name;
+
+	return 0;
+}
 
 int vc_elf_get_memory_size(VcElf *elf, uint32_t *out_size) {
 	if (!elf->loaded) {
@@ -1730,4 +1776,42 @@ int vc_elf_get_local_variables_at_pc(VcElf *elf, uint32_t address, VcFrameState 
 	FREE(scopes);
 
 	return 0;
+}
+
+int vc_elf_load_sce_module_info(VcElf *elf) {
+	GElf_Ehdr ehdr_mem;
+	GElf_Ehdr *ehdr = gelf_getehdr(elf->elf, &ehdr_mem);
+	if (!ehdr) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Failed to get the file header: %s", elf_errmsg(-1));
+		goto error;
+	}
+
+	GElf_Phdr mem;
+	GElf_Phdr *phdr = gelf_getphdr(elf->elf, 0, &mem);
+	if (!phdr) {
+		vc_elf_set_error(elf, VC_ELF_ERROR_INVALID_ELF, "Failed to get program header %u: %s", 0, elf_errmsg(-1));
+		goto error;
+	}
+
+	Elf_Data *module_info_data = elf_getdata_rawchunk(elf->elf, phdr->p_offset + ehdr->e_entry, sizeof(SceModuleInfo), ELF_T_BYTE);
+
+	SceModuleInfo *module_info = (SceModuleInfo *)module_info_data->d_buf;
+
+	elf->module_name = strdup(module_info->name);
+
+	if (!elf->exidx_data && module_info->exidx_top) {
+		elf->exidx_data = elf_getdata_rawchunk(elf->elf, phdr->p_offset + module_info->exidx_top, module_info->exidx_end - module_info->exidx_top, ELF_T_BYTE);
+		elf->exidx_start_address = phdr->p_vaddr + module_info->exidx_top;
+	}
+
+	if (!elf->extab_data && module_info->extab_top) {
+		elf->extab_data = elf_getdata_rawchunk(elf->elf, phdr->p_offset + module_info->extab_top, module_info->extab_end - module_info->extab_top, ELF_T_BYTE);
+		elf->extab_start_address = phdr->p_vaddr + module_info->extab_top;
+	}
+
+	return 0;
+
+error:
+	FREE(elf->module_name);
+	return -1;
 }

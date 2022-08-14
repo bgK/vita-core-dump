@@ -9,6 +9,13 @@ pkg_search_module(ZLib REQUIRED IMPORTED_TARGET zlib)
 pkg_search_module(LibElf REQUIRED IMPORTED_TARGET libelf)
 pkg_search_module(LibDw REQUIRED IMPORTED_TARGET libdw)
 
+include(TestBigEndian)
+test_big_endian(is_big_endian)
+
+if (is_big_endian)
+	message(FATAL_ERROR "vita-core-dump does not work on big endian systems")
+endif()
+
 add_compile_options(-Wall -Wextra)
 
 add_executable(

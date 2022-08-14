@@ -59,7 +59,7 @@ It is recommended to use debug builds without optimizations so `vita-core-dump` 
 Error conditions:
 | Error message | Explanation   |
 | ------------- | ------------- |
-| Could not find a core dump module matching the elf file name 'my_game' | The name of the elf file must match the corresponding module. Use the `modules` command to see the core dump's module table. |
+| Could not find a core dump module named 'my_game' | Prefer loading SCE elf files (often with the `.velf` extension) as they specify their module name. Otherwise, the name of the elf file must match the corresponding module. Use the `modules` command to see the core dump's module table. |
 | Unable to unwind: No binary for module 'my_game' | The binary for the module `my_game` was not found. You can load more binaries by using the `--add-elf` argument. At the moment it is not possible to load Sony's `.prx` modules. |
 | Failed to unwind: No CFI information at PC 0xnnnnnnnn | The code for this frame was compiled without Call Frame Information. Recompile the game / library with debug information (`-g`). |
 | Unable to unwind: No module for PC 0xnnnnnnnn | Execution reached an address that is not described in the core dump's modules table. You can use `--add-elf` with the load address set to declare executable memory areas not known to the Vita OS. |
@@ -73,7 +73,7 @@ Displays a hex dump of the crashed process's memory at the specified address. Th
 the other commands.
 ```
 $ ./vita-core-dump ../test8/psp2core.bin.psp2dmp memory 812c0ed8 --length=6
-812c0ed8: 68 65 6c 6c  6f 00                                                                                       |hello.                          |
+812c0ed8: 68 65 6c 6c  6f 00    |hello. |
 ```
 
 ### The `modules` command
